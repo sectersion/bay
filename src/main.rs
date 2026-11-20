@@ -47,7 +47,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let _ = cli.cmd;
     Err(anyhow::anyhow!(
-        "not implemented — see ROADMAP.md (M0 spike first)"
+        "not implemented — start with issue M0, the spike (#1)"
     ))
 }
 

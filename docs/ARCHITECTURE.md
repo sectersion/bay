@@ -1,6 +1,6 @@
 # bay architecture
 
-Status: v1 design. Milestones in [ROADMAP.md](../ROADMAP.md).
+Status: v1 design. Milestones live as GitHub issues (#1–#5), not files.
 
 ## Problem
 
@@ -49,7 +49,7 @@ The daemon is organized around exactly one seam per hard problem:
 ### Engines
 
 `Engine` (`src/engine.rs`) is the whole hypervisor abstraction:
-`boot(golden) → bay`, `pause`, `resume`, `kill`. No fleet logic may call a
+`boot(golden) → bay`, `halt`, `resume`, `kill`. No fleet logic may call a
 hypervisor API directly; CI runs all three platforms from day one.
 
 | host | engine | notes |
