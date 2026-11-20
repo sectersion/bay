@@ -12,13 +12,17 @@ in place. Full design: `docs/ARCHITECTURE.md`. Plan and todos: GitHub issues
 
 ## Repo rules (owner-set, absolute)
 
-1. **Every feature gets an issue and its own PR.** Issues are the global todo
+1. **Every change gets an issue and its own PR.** Issues are the global todo
    list. Never write TODOs, checklists, or roadmap content into files — file
    an issue.
 2. **Two independent agent reviews must pass before any merge.** Each posts a
-   formal review comment whose body starts `APPROVED`. If anything is wrong:
-   fix, push, re-review both. (GitHub rejects approving reviews from the
-   author's account, so this gate is procedural, not settings-based.)
+   formal review comment whose body starts `APPROVED` (or `CHANGES_REQUESTED`
+   with specifics) and names the head SHA it reviewed. Verdicts only count
+   against the final head: any push invalidates both reviews — re-run both
+   until a clean round matches the SHA actually merged. (GitHub rejects
+   approving reviews from the author's own account, so this gate is
+   procedural, not settings-based; the squash-only merge-method setting is
+   repo-enforced.)
 3. **Never push to main.** Branch → PR → squash-merge. Protection enforces
    this, admins included.
 
