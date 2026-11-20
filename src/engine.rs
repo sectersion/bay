@@ -35,6 +35,6 @@ pub trait Engine {
 /// Pick the engine for the current host.
 pub fn native_engine() -> anyhow::Result<Box<dyn Engine>> {
     anyhow::bail!(
-        "no engine implemented yet; target for M1: Cloud Hypervisor on Linux (WSL2 counts). See ROADMAP.md."
+        "no engine implemented yet; target for M1 (#2): Cloud Hypervisor on Linux (WSL2 counts)."
     )
 }

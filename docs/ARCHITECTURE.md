@@ -1,6 +1,6 @@
 # bay architecture
 
-Status: v1 design. Milestones in [ROADMAP.md](../ROADMAP.md).
+Status: v1 design. Milestones live as GitHub issues (#1–#5), not files.
 
 ## Problem
 

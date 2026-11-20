@@ -27,7 +27,7 @@ RAM.
 
 ## Status
 
-Design + Rust skeleton. The hypervisor seam is `src/engine.rs`, the plan is
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and the order of operations is
-[ROADMAP.md](ROADMAP.md) — starting with the M0 spike: restore a 50MB bay in
-<300ms.
+Design + Rust skeleton. The hypervisor seam is `src/engine.rs`, the design is
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and the plan lives in GitHub
+issues — start with [M0, the spike](https://github.com/sectersion/bay/issues/1):
+restore a 50MB bay in <300ms.
