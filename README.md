@@ -27,4 +27,7 @@ RAM.
 
 ## Status
 
-Nothing built yet. Stack and platform target are open decisions.
+Design + Rust skeleton. The hypervisor seam is `src/engine.rs`, the plan is
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), and the order of operations is
+[ROADMAP.md](ROADMAP.md) — starting with the M0 spike: restore a 50MB bay in
+<300ms.

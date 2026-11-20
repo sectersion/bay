@@ -1,0 +1,10 @@
+[package]
+name = "bay"
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+description = "Give each agent its own bay — disposable microVM homes for coding agent fleets"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
