@@ -7,7 +7,9 @@
  *     shell command = the rest of the line, run as `bash --login -c <cmd>`.
  *     argv is joined + shell-quoted host-side, so a newline or the end of
  *     the line terminates the command (commands containing raw newlines are
- *     out of scope for M1 — pass `printf 'a\nb'` instead).
+ *     out of scope for M1 — pass `printf 'a\nb'` instead). Lines longer
+ *     than 8191 bytes (incl. the newline) are rejected with an error and
+ *     sentinel exit 1, never truncated into the PTY as stdin.
  *   Stream after that: raw PTY output until the command exits, then the
  *   agent's own final line: "BAY_EXIT <nonce> <code>\n" (shell convention:
  *   signal death = 128+signo). The sentinel is always the last thing on the
@@ -41,10 +43,12 @@ static void serve(int c) {
     signal(SIGCHLD, SIG_DFL);
     char line[8192];
     size_t len = 0;
-    /* read first line */
+    int eol = 0;
+    /* read first line; the line (including \n) must fit in 8191 bytes */
     while (len < sizeof line - 1) {
         ssize_t n = read(c, line + len, 1);
-        if (n <= 0 || line[len] == '\n') break;
+        if (n <= 0) break;
+        if (line[len] == '\n') { eol = 1; break; }
         len++;
     }
     line[len] = 0;
@@ -53,6 +57,17 @@ static void serve(int c) {
     *sp = 0;
     char *nonce = line, *cmd = sp + 1;
     if (*cmd == 0) _exit(1);
+    if (!eol && len == sizeof line - 1) {
+        /* oversized first line: reject with a clear error + sentinel instead
+           of running a truncated command and streaming the remainder into
+           the PTY as stdin (host first_line enforces the same cap). */
+        char err[256];
+        int en = snprintf(err, sizeof err,
+                          "bay exec: command line exceeds 8191 bytes\n"
+                          "\nBAY_EXIT %s 1\n", nonce);
+        if (en > 0) { ssize_t _w = write(c, err, en); (void)_w; }
+        _exit(1);
+    }
 
     signal(SIGPIPE, SIG_IGN); /* host may hang up first */
     int m;

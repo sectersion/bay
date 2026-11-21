@@ -97,7 +97,7 @@ fn handle(mut conn: std::os::unix::net::UnixStream) -> anyhow::Result<()> {
             }
         };
         let outcome = match req {
-            Request::Up { n, .. } => up(&mut conn, n),
+            Request::Up { n, repo } => up(&mut conn, n, repo),
             Request::Exec { bay, argv } => exec_relay(&mut conn, &home, bay, &argv),
             other => reply(&mut conn, &dispatch(&other)).and(Ok(true)),
         };
@@ -119,7 +119,17 @@ fn handle(mut conn: std::os::unix::net::UnixStream) -> anyhow::Result<()> {
 /// all booted. ponytail: single golden pick (latest mtime); per-bay golden
 /// pinning lands with halt/wake (#14's full fleet state is a later box).
 #[cfg(unix)]
-fn up(conn: &mut std::os::unix::net::UnixStream, n: u32) -> anyhow::Result<bool> {
+fn up(
+    conn: &mut std::os::unix::net::UnixStream,
+    n: u32,
+    repo: Option<PathBuf>,
+) -> anyhow::Result<bool> {
+    // --repo is parsed but nothing mounts it yet: error instead of replying
+    // Ok to a flag that did nothing (#30 review). Honors the docs the flag
+    // was added with (#14: repo mounting) — flip to real work when that lands.
+    if repo.is_some() {
+        anyhow::bail!("REPO_NOT_SUPPORTED: --repo mounts land with #14");
+    }
     let home = bay_home()?;
     let gdir = latest_golden(&home.join("golden")).ok_or_else(|| {
         anyhow::anyhow!("NO_GOLDEN: bake one first (`bay bake <manifest.toml>`)")

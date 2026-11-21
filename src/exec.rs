@@ -27,7 +27,17 @@ pub fn first_line(nonce: &str, argv: &[String]) -> anyhow::Result<Vec<u8>> {
         .map(|a| shell_quote(a))
         .collect::<Vec<_>>()
         .join(" ");
-    Ok(format!("{nonce} {cmd}\n").into_bytes())
+    let line = format!("{nonce} {cmd}\n");
+    // The guest caps the first line at 8191 bytes (vsockd.c) and rejects
+    // anything longer; reject here too instead of paying a round trip and a
+    // misleading truncated-command run (#30 review).
+    if line.len() > 8191 {
+        anyhow::bail!(
+            "exec: command line too long ({} bytes; guest limit 8191)",
+            line.len()
+        );
+    }
+    Ok(line.into_bytes())
 }
 
 /// Per-exec nonce: distinct across concurrent CLI processes and repeats.
@@ -190,7 +200,13 @@ mod relay_impl {
 
         let _raw = RawMode::enter();
         let mut inbound = sock.try_clone()?;
-        let stdin_t = std::thread::spawn(move || {
+        // detached on purpose: after the guest EOFs, a stdin read on a live
+        // TTY never returns (a TTY does not EOF when the socket half-closes),
+        // so joining this thread would hang `bay exec` forever from a real
+        // terminal. The process exits when `run` returns, killing the thread
+        // with it (#30 review). pipe_both's join is bounded (socket EOF) and
+        // stays.
+        std::thread::spawn(move || {
             let mut buf = [0u8; 8192];
             let mut stdin = std::io::stdin();
             while let Ok(r) = stdin.read(&mut buf) {
@@ -216,7 +232,6 @@ mod relay_impl {
         }
         drop(_raw);
         let (body, code) = strip_exit_body(tail, &n);
-        let _ = stdin_t.join();
         std::io::Write::write_all(&mut std::io::stdout(), &body)?;
         std::io::Write::flush(&mut std::io::stdout())?;
         code.ok_or_else(|| anyhow::anyhow!("relay closed with no exit sentinel (guest agent died?)"))
@@ -276,6 +291,11 @@ mod tests {
         assert!(String::from_utf8_lossy(&first_line("n", &["a;b".into()]).unwrap()).contains("'a;b'"));
         assert!(first_line("n", &[]).is_err());
         assert!(first_line("n", &["two\nlines".into()]).is_err());
+        // first-line cap matches vsockd.c's 8191-byte line (incl. newline):
+        // oversized commands are rejected, not truncated into PTY stdin.
+        // "n " + quoted arg + "\n" = 2 + (len+2) + 1
+        assert!(first_line("n", &["x".repeat(8186).into()]).is_ok());
+        assert!(first_line("n", &["x".repeat(8187).into()]).is_err());
     }
 
     #[test]
@@ -460,6 +480,45 @@ mod integration {
         // 5. unknown bay
         let out = cli(&home, &["exec", "99", "--", "echo", "x"]);
         anyhow::ensure!(!out.status.success(), "exec on missing bay must fail");
+
+        // 6. TTY-attached exec — the PR #30 blocker regression: joining the
+        //    stdin-relay thread never returns when stdin is a live terminal,
+        //    so `bay exec` hung (no output, no exit code) until Ctrl-C.
+        //    Command::output() nulls the child's stdin (immediate EOF) and
+        //    structurally cannot catch this; `script` allocates a real pty.
+        //    A hang here must FAIL the test, not hang the suite: deadline.
+        let ts = root.join("pty.typescript");
+        let cmd = format!("\"{}\" exec 1 -- echo hi", bin().display());
+        let tsp = ts.to_string_lossy().into_owned();
+        let mut pty = Command::new("script")
+            .args(["-qec", cmd.as_str(), tsp.as_str()])
+            .env("BAY_HOME", &home)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("`script` (util-linux) needed for the pty test: {e}"))?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let st = loop {
+            match pty.try_wait()? {
+                Some(st) => break st,
+                None if Instant::now() > deadline => {
+                    let _ = pty.kill();
+                    let _ = pty.wait();
+                    anyhow::bail!(
+                        "pty exec hung past 30s — stdin-relay join regression (#30 review blocker)"
+                    );
+                }
+                None => std::thread::sleep(Duration::from_millis(50)),
+            }
+        };
+        let pty_out = std::fs::read(&ts).unwrap_or_default();
+        let pty_text = String::from_utf8_lossy(&pty_out).replace("\r\n", "\n");
+        anyhow::ensure!(
+            st.success() && pty_text.contains("hi") && !pty_text.contains("BAY_EXIT"),
+            "pty exec: status={st:?} typescript={pty_text:?}"
+        );
+        println!("PTY-TTY: ok");
 
         daemon.kill()?;
         daemon.wait()?;
