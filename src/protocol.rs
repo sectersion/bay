@@ -8,6 +8,14 @@
 //! The `type` tag makes a reply carrying both ok and error fields impossible
 //! to produce and impossible to parse (#22).
 //!
+//! Tolerance policy (deliberate, do not "tighten"): receivers MUST ignore
+//! unknown fields — `deny_unknown_fields` is intentionally absent. Senders
+//! may add fields to `ok` payloads without a version bump; old clients keep
+//! parsing such replies as success.
+//!
+//! Requests are also internally tagged, but with tag key `cmd` (`{"cmd":"ping"}`).
+//! The duality is deliberate: `cmd` for intent, `type` for outcome.
+//!
 //! Contract for later M1 workers: `Response::Ok` gains payload fields as
 //! commands land; `dispatch` is the single place stubs become real.
 
