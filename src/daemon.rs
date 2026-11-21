@@ -115,7 +115,7 @@ mod tests {
             let _ = serve(listener);
         });
         let resp = crate::client::round_trip(&sock, &Request::Ping).unwrap();
-        assert_eq!(resp, Response::Ok { ok: true });
+        assert_eq!(resp, Response::Ok);
         let _ = std::fs::remove_file(&sock);
     }
 }

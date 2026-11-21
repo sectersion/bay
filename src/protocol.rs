@@ -1,6 +1,13 @@
 //! Wire protocol between the bay CLI and bayd (#14). One JSON object per
 //! line per direction on a socket connection.
 //!
+//! Responses are internally tagged — a reply is exactly one of:
+//! - `{"type":"ok", ...}` — success; payload fields are added as commands land
+//! - `{"type":"error","error":"<TOKEN>"}` — failure; `error` is a machine token
+//!
+//! The `type` tag makes a reply carrying both ok and error fields impossible
+//! to produce and impossible to parse (#22).
+//!
 //! Contract for later M1 workers: `Response::Ok` gains payload fields as
 //! commands land; `dispatch` is the single place stubs become real.
 
@@ -39,9 +46,10 @@ pub enum Request {
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Eq)]
-#[serde(untagged)]
+#[serde(tag = "type", rename_all = "lowercase")]
 pub enum Response {
-    Ok { ok: bool },
+    Ok,
+    #[serde(rename = "error")]
     Err { error: String },
 }
 
@@ -49,7 +57,7 @@ pub const NOT_IMPLEMENTED: &str = "NOT_IMPLEMENTED";
 
 pub fn dispatch(req: &Request) -> Response {
     match req {
-        Request::Ping => Response::Ok { ok: true },
+        Request::Ping => Response::Ok,
         _ => Response::Err {
             error: NOT_IMPLEMENTED.to_string(),
         },
@@ -109,11 +117,23 @@ mod tests {
     #[test]
     fn response_wire_shape() {
         assert_eq!(
-            serde_json::to_string(&Response::Ok { ok: true }).unwrap(),
-            r#"{"ok":true}"#
+            serde_json::to_string(&Response::Ok).unwrap(),
+            r#"{"type":"ok"}"#
         );
         assert_eq!(
-            serde_json::from_str::<Response>(r#"{"error":"NOT_IMPLEMENTED"}"#).unwrap(),
+            serde_json::to_string(&Response::Err {
+                error: "NOT_IMPLEMENTED".to_string()
+            })
+            .unwrap(),
+            r#"{"type":"error","error":"NOT_IMPLEMENTED"}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(r#"{"type":"ok"}"#).unwrap(),
+            Response::Ok
+        );
+        assert_eq!(
+            serde_json::from_str::<Response>(r#"{"type":"error","error":"NOT_IMPLEMENTED"}"#)
+                .unwrap(),
             Response::Err {
                 error: "NOT_IMPLEMENTED".to_string()
             }
@@ -121,8 +141,19 @@ mod tests {
     }
 
     #[test]
+    fn reply_cannot_be_both_ok_and_error() {
+        // regression for #22: under the old untagged enum, a reply carrying
+        // both fields parsed as Ok and the error vanished silently.
+        assert!(serde_json::from_str::<Response>(r#"{"ok":true,"error":"boom"}"#).is_err());
+        // no tag at all (old error shape) is no longer valid
+        assert!(serde_json::from_str::<Response>(r#"{"error":"boom"}"#).is_err());
+        // the error arm cannot be faked as ok: `error` field is required
+        assert!(serde_json::from_str::<Response>(r#"{"type":"error"}"#).is_err());
+    }
+
+    #[test]
     fn dispatch_ping_is_ok() {
-        assert_eq!(dispatch(&Request::Ping), Response::Ok { ok: true });
+        assert_eq!(dispatch(&Request::Ping), Response::Ok);
     }
 
     #[test]
