@@ -891,10 +891,17 @@ mod integration {
         let _ = child.wait()?;
         assert!(super::marker(&home, &hash).exists(), "crash must leave the in-flight marker");
         // plant dead-pid + foreign sockets: recovery sweeps ours, never the
-        // foreign file.
+        // foreign file. The fake pid is seeded from the clock and kept above
+        // pid_max's 4194304 ceiling (dead by construction) so two overlapping
+        // runs on one seat cannot collide on planted names.
         let tmp = std::env::temp_dir();
-        let own = tmp.join("bay-bake-4294967295.sock"); // pid that cannot exist
-        let foreign = tmp.join("bay-bake-impostor.sock");
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos() as u64)
+            .unwrap_or(0);
+        let dead_pid: u32 = (5_000_000 + nanos % 4_000_000_000) as u32;
+        let own = tmp.join(format!("bay-bake-{dead_pid}.sock"));
+        let foreign = tmp.join(format!("bay-bake-impostor-{}.sock", std::process::id()));
         std::fs::write(&own, b"")?;
         std::fs::write(&foreign, b"")?;
 
