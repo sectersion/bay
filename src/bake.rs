@@ -860,14 +860,11 @@ mod integration {
         let hash = m.content_hash(&std::fs::read(&mp)?)?;
         let gdir = golden_dir(&home, &hash);
 
-        // the CLI binary the child bakes with: next to the test binary in
-        // target/debug/, or explicit BAY_BIN.
-        let bin = std::env::var_os("BAY_BIN").map(PathBuf::from).unwrap_or_else(|| {
-            std::env::current_exe()
-                .ok()
-                .and_then(|e| e.parent().and_then(|p| p.parent()).map(|d| d.join("bay")))
-                .unwrap_or_else(|| PathBuf::from("bay"))
-        });
+        // the CLI binary the child bakes with: the crate's debug bin, or
+        // explicit BAY_BIN.
+        let bin = std::env::var_os("BAY_BIN")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("target/debug/bay"));
         let mut child = std::process::Command::new(&bin)
             .arg("bake")
             .arg(&mp)
