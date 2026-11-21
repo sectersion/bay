@@ -2,6 +2,7 @@
 
 use clap::{Parser, Subcommand};
 
+mod ch50;
 mod client;
 mod daemon;
 mod engine;

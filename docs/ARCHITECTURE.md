@@ -54,9 +54,48 @@ hypervisor API directly; CI runs all three platforms from day one.
 
 | host | engine | notes |
 |---|---|---|
-| Linux | **Cloud Hypervisor** (subprocess, API socket) | full power: snapshot/restore, qcow2 CoW, vsock. Don't embed; drive. |
+| Linux | **Cloud Hypervisor v50** (subprocess, API socket) | full power: snapshot/restore, qcow2 CoW, vsock. Don't embed; drive. Pinned to v50 (see DR-1). |
 | macOS | **Apple Virtualization.framework** | boot + checkpoint/restore (macOS 14+), virtio-vsock host API, CoW via APFS `clonefile`. Thin Swift shim or objc2 bindings. |
 | Windows | **WSL2 running the Linux engine** | not a port; the CH engine, inside WSL2, with the full feature set including snapshots. Native WHPX is a possible later engine, not a v1 dependency. |
+
+## Decision records
+
+### DR-1: disk CoW = qcow2 backing chain; engine pinned to CH v50
+
+Resolves the open question in #16. Tested empirically on the M0 kit
+(ch-v50, Kata 6.18 kernel, WSL2 ext4, 2026-11-20):
+
+- **CH v50 ships qcow2** (`block/src/qcow`), but its reader only accepts a
+  *qcow2-format* backing file: a raw/ext4 backing dies at boot with
+  `BackingFileOpen(InvalidMagic)`. qcow2-on-qcow2 boots and isolates writes
+  byte-for-byte (marker lands in the bay overlay; golden base untouched).
+- A hand-crafted minimal (header-only) overlay was rejected by CH
+  ("Failed to read header"); a fresh `qemu-img create` overlay is 196KB.
+  So bake produces the template, and `boot` just copies it — **no qemu-img
+  (or any copy of image data) at `up` time**.
+
+Decision: golden dirs carry `disk.qcow2` (base, via `qemu-img convert` at
+bake) + `overlay.tmpl.qcow2` (backing = base, created once by bake) +
+`snapshot/`. `Engine::boot` = copy template (196KB, instant) → stage the
+golden snapshot with the bay's paths rewritten into `config.json` (plain
+JSON; disk path + host vsock socket) → `--restore` → `resume`. Measured:
+restore→PTY-socket 75ms; per-bay disk cost ~200KB regardless of image size.
+
+Rejected:
+- **sparse copy per bay** — the kit rootfs is 901MB *fully allocated*;
+  `up 4` = 3.6GB of real IO per call. O(bytes-in-image), not O(changes).
+- **reflink / btrfs volume** — WSL's ext4 has no reflink; a btrfs loop
+  volume adds mkfs/mount lifecycle under fleet state (module loads, but
+  the move isn't worth 4 lines of ioctl it would save).
+- **dm-snapshot** — `CONFIG_DM_SNAPSHOT=m` loads here and works, but
+  per-bay loop devices + dm tables + crash reconciliation
+  (`dmsetup ls`∩`losetup -j` on daemon restart) is strictly more
+  machinery than "copy a 196KB file".
+
+v50 pin (from #1): WSL2's Microsoft KVM lacks `KVM_CAP_USER_MEMORY2`
+(v55+ refuses to boot; verified via ioctl, not folklore). v34's vsock RX
+ring is broken against modern guest kernels. Native Linux can run modern
+CH; the pin should be revisited when WSL's KVM gains the cap.
 
 ### Common services (engine-independent)
 
