@@ -20,7 +20,9 @@ pub trait Engine {
     fn name(&self) -> &'static str;
 
     /// Restore a bay from the golden with a fresh CoW disk. Target: ~200ms.
-    fn boot(&mut self, golden: &Golden) -> anyhow::Result<Pty>;
+    /// `bay` is the daemon's fleet id (the same one halt/resume/kill take);
+    /// the engine keys its per-bay state by it.
+    fn boot(&mut self, bay: u32, golden: &Golden) -> anyhow::Result<Pty>;
 
     /// Snapshot + stop. Parked bays must cost ~zero RAM.
     fn halt(&mut self, bay: u32) -> anyhow::Result<()>;
@@ -33,8 +35,19 @@ pub trait Engine {
 }
 
 /// Pick the engine for the current host.
+#[cfg(target_os = "linux")]
+pub fn native_engine() -> anyhow::Result<Box<dyn Engine>> {
+    use crate::ch50::Ch50Engine;
+    Ok(Box::new(Ch50Engine::new(
+        crate::daemon::bay_home()?.join("bays"),
+    )?))
+}
+
+/// Pick the engine for the current host.
+#[cfg(not(target_os = "linux"))]
 pub fn native_engine() -> anyhow::Result<Box<dyn Engine>> {
     anyhow::bail!(
-        "no engine implemented yet; target for M1 (#2): Cloud Hypervisor on Linux (WSL2 counts)."
+        "no engine for this host yet: macOS ships in M3 (#4); on Windows run \
+         `bay daemon` under WSL2 — the Cloud Hypervisor v50 engine (ch50) lives there."
     )
 }
