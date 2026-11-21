@@ -2,7 +2,12 @@
 
 use clap::{Parser, Subcommand};
 
+mod client;
+mod daemon;
 mod engine;
+mod protocol;
+
+use protocol::Request;
 
 #[derive(Parser)]
 #[command(name = "bay", version, about = "give each agent its own bay")]
@@ -38,17 +43,34 @@ enum Cmd {
         #[arg(long)]
         all: bool,
     },
+    /// Ask the daemon if it is alive, print its reply
+    Ping,
     /// Run the fleet daemon (normally spawned by the CLI)
     #[command(hide = true)]
     Daemon,
 }
 
 fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    let _ = cli.cmd;
-    Err(anyhow::anyhow!(
-        "not implemented — start with issue M0, the spike (#1)"
-    ))
+    match Cli::parse().cmd {
+        Cmd::Daemon => daemon::run(),
+        Cmd::Ping => submit(Request::Ping),
+        Cmd::Bake { manifest } => submit(Request::Bake { manifest }),
+        Cmd::Up { n, repo } => submit(Request::Up { n, repo }),
+        Cmd::Exec { bay, cmd } => submit(Request::Exec { bay, argv: cmd }),
+        Cmd::Halt { bay } => submit(Request::Halt { bay }),
+        Cmd::Wake { bay } => submit(Request::Wake { bay }),
+        Cmd::Kill { bay, all } => submit(Request::Kill { bay, all }),
+    }
+}
+
+/// Thin client: send one request, print one reply line, exit nonzero on error.
+fn submit(req: Request) -> anyhow::Result<()> {
+    let resp = client::request(&req)?;
+    println!("{}", serde_json::to_string(&resp)?);
+    if matches!(resp, protocol::Response::Err { .. }) {
+        std::process::exit(1);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
