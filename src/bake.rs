@@ -192,8 +192,14 @@ fn run_linux(manifest_path: &Path) -> anyhow::Result<Outcome> {
         return Ok(Outcome { hash, dir: gdir, baked: false });
     }
     // Crashed bake left a dir + marker: wipe (marker path implies dir may
-    // exist half-written).
+    // exist half-written). A SIGKILL inside the chroot/mount window leaves
+    // gdir/mnt loop-mounted, and remove_dir_all on a mounted subtree is
+    // EBUSY forever — retry wedges (#28 round-1 blocker). Tear the mount
+    // subtree down first, best-effort, then remove; sweep dead bakers'
+    // transient /tmp sockets while we're recovering.
     if gdir.exists() {
+        let _ = teardown_mounts(&gdir, false);
+        sweep_stale_bake_sockets();
         std::fs::remove_dir_all(&gdir)?;
     }
     std::fs::create_dir_all(&home.join("golden"))?;
@@ -245,27 +251,16 @@ fn build_disk(m: &Manifest, gdir: &Path) -> anyhow::Result<()> {
     std::fs::copy(&m.base_rootfs, &raw)?;
     let mnt = gdir.join("mnt");
     std::fs::create_dir_all(&mnt)?;
-    // stack of mounted paths in mount order; teardown always in reverse,
-    // best-effort on the failure path so a mid-chroot error never strands a
-    // loop device (a stranded mount once survived a failed bake at
-    // /tmp/bay-bk-*, holding a deleted rootfs.raw open).
-    let mut stack = vec![mnt.clone()];
-    let flip = |stack: &mut Vec<PathBuf>, eager: bool| -> anyhow::Result<()> {
-        while let Some(p) = stack.pop() {
-            if eager {
-                run_cmd(&umount_argv(&p))?;
-            } else {
-                let _ = run_cmd(&umount_argv(&p));
-            }
-        }
-        Ok(())
-    };
+    // Teardown of everything under gdir goes through the shared
+    // teardown_mounts guard (mountinfo-driven, so a SIGKILL can't strand a
+    // loop mount that the retry's recovery then chokes on forever — #28
+    // round-1 blocker), never through an in-memory stack that dies with the
+    // process.
     let staged = (|| -> anyhow::Result<()> {
         run_cmd(&mount_loop_argv(&raw, &mnt))?;
         for src in ["/dev", "/proc", "/sys"] {
             let dst = mnt.join(src.trim_start_matches('/'));
             run_cmd(&bind_argv(src, &dst))?;
-            stack.push(dst);
         }
         let _ = std::fs::copy("/etc/resolv.conf", mnt.join("etc/resolv.conf"));
         if !m.packages.is_empty() {
@@ -292,15 +287,156 @@ fn build_disk(m: &Manifest, gdir: &Path) -> anyhow::Result<()> {
         Ok(())
     })();
     if let Err(e) = staged {
-        let _ = flip(&mut stack, false);
+        let _ = teardown_mounts(gdir, false);
         let _ = std::fs::remove_dir_all(&mnt);
         return Err(e);
     }
-    flip(&mut stack, true)?;
+    // Eager: the qcow2 convert must not read the raw image before its
+    // mounts are really gone (unflushed chroot writes would be lost).
+    teardown_mounts(gdir, true)?;
     std::fs::remove_dir_all(&mnt)?;
     run_cmd(&convert_argv(&raw, &disk))?;
     std::fs::remove_file(&raw)?;
     Ok(())
+}
+
+/// Best-effort reverse-order teardown of every mount at or under `gdir`,
+/// plus detach of the loop devices backing it. Reads the kernel's view
+/// (`/proc/self/mountinfo`) instead of any in-memory stack, so it is
+/// correct for a mount a SIGKILLed bake left behind. `eager` = fail on the
+/// first umount error (success path: convert must wait for real unmounts);
+/// otherwise ignore all errors — cleanup on a failure or recovery path is
+/// never allowed to wedge the retry it is enabling. Does not remove
+/// directories; callers do their own removal after this.
+#[cfg(target_os = "linux")]
+fn teardown_mounts(gdir: &Path, eager: bool) -> anyhow::Result<()> {
+    let prefix = gdir.display().to_string();
+    let info = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+    for p in mounts_under(&info, &prefix) {
+        let r = run_cmd(&umount_argv(Path::new(&p)));
+        if eager {
+            r?;
+        } else {
+            let _ = r;
+        }
+    }
+    for dev in loop_backing(&info, &prefix) {
+        let _ = run_cmd(&["losetup".into(), "-d".into(), dev]);
+    }
+    // Loop attached with no mount (bake killed between attach and mount in
+    // `mount -o loop`): only findable via the backing file.
+    let raw = gdir.join("rootfs.raw");
+    if let Some(out) = stdout_of(&["losetup".into(), "-j".into(), raw.display().to_string()]) {
+        for dev in losetup_devices(&out) {
+            let _ = run_cmd(&["losetup".into(), "-d".into(), dev]);
+        }
+    }
+    Ok(())
+}
+
+/// Reap /tmp sockets a dead bake left behind: names from OUR scheme only
+/// (`bay-bake-{pid}[-vsock].sock`), removed only when the embedded pid no
+/// longer exists in /proc. Foreign /tmp files are never touched.
+#[cfg(target_os = "linux")]
+fn sweep_stale_bake_sockets() {
+    let Ok(rd) = std::fs::read_dir(std::env::temp_dir()) else { return };
+    for e in rd.flatten() {
+        let Some(pid) = bake_socket_pid(&e.file_name().to_string_lossy()) else { continue };
+        // ponytail: pid-reuse can spare a stale socket (harmless — a live
+        // CH re-binds its own on exit; worst case one dead file lingers a
+        // little longer).
+        if proc_alive(Path::new("/proc"), pid) {
+            continue;
+        }
+        let _ = std::fs::remove_file(e.path());
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn stdout_of(argv: &[String]) -> Option<String> {
+    let out = std::process::Command::new(&argv[0]).args(&argv[1..]).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+// ---- pure mountinfo/socket helpers: compiled + unit-tested on all CI hosts ----
+
+/// Undo mountinfo's octal escapes (`\040` space, `\011` tab, `\012`
+/// newline, `\134` backslash); a stray backslash passes through.
+fn unescape_mount(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find('\\') {
+        out.push_str(&rest[..i]);
+        let digits = &rest[i + 1..];
+        if digits.len() >= 3 && digits.as_bytes()[..3].iter().all(|b| *b >= b'0' && *b <= b'7') {
+            if let Ok(v) = u8::from_str_radix(&digits[..3], 8) {
+                out.push(if v == 0x5c { '\\' } else { v as char });
+                rest = &digits[3..];
+                continue;
+            }
+        }
+        out.push('\\');
+        rest = &rest[i + 1..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Mount points at or under `prefix`, deepest-first (children unmounted
+/// before parents). `mountinfo` is the raw text of /proc/self/mountinfo.
+pub(crate) fn mounts_under(mountinfo: &str, prefix: &str) -> Vec<String> {
+    let mut v: Vec<String> = mountinfo
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let mp = unescape_mount(*f.get(4)?);
+            (mp == prefix || mp.starts_with(&format!("{prefix}/"))).then_some(mp)
+        })
+        .collect();
+    v.sort_by_key(|p| std::cmp::Reverse(p.matches('/').count()));
+    v
+}
+
+/// `/dev/loopN` devices backing mounts at or under `prefix`, deduped.
+pub(crate) fn loop_backing(mountinfo: &str, prefix: &str) -> Vec<String> {
+    let mut v: Vec<String> = mountinfo
+        .lines()
+        .filter_map(|l| {
+            let f: Vec<&str> = l.split_whitespace().collect();
+            let sep = f.iter().position(|t| *t == "-")?;
+            let mp = unescape_mount(*f.get(4)?);
+            let src = f.get(sep + 2)?;
+            (src.starts_with("/dev/loop")
+                && (mp == prefix || mp.starts_with(&format!("{prefix}/"))))
+                .then(|| src.to_string())
+        })
+        .collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// Device names in `losetup -j <path>` output (lines like
+/// `/dev/loopN: [maj:min]:ino (path)`).
+pub(crate) fn losetup_devices(out: &str) -> Vec<String> {
+    out.lines()
+        .filter_map(|l| {
+            l.split(':').next().filter(|d| d.starts_with("/dev/loop")).map(String::from)
+        })
+        .collect()
+}
+
+/// Pid embedded in one of OUR transient bake socket names, `None` for every
+/// other file name — the sweep never claims foreign /tmp files.
+pub(crate) fn bake_socket_pid(name: &str) -> Option<u32> {
+    let rest = name.strip_prefix("bay-bake-")?;
+    let pid = rest.strip_suffix("-vsock.sock").or_else(|| rest.strip_suffix(".sock"))?;
+    pid.parse().ok()
+}
+
+/// True if `pid` has an entry under a /proc-style directory root.
+pub(crate) fn proc_alive(proc_root: &Path, pid: u32) -> bool {
+    proc_root.join(pid.to_string()).is_dir()
 }
 
 /// Read-only everything: a sealed golden cannot be written by anyone in this
@@ -488,6 +624,85 @@ base_rootfs = "r"
         );
     }
 
+    #[test]
+    fn mounts_under_deepest_first_and_prefix_scoped() {
+        // fake mountinfo: loop mount at gdir/mnt, binds below it, a mount
+        // under a look-alike prefix that must NOT match, foreign mounts.
+        let info = "36 24 7:0 / /g/abc/mnt rw,relatime shared:1 - ext4 /dev/loop0 rw\n\
+                    40 36 0:38 / /g/abc/mnt/dev rw shared:2 - tmpfs tmpfs rw\n\
+                    41 36 0:39 / /g/abc/mnt/proc rw shared:3 - proc proc rw\n\
+                    42 36 0:40 / /g/abc/mnt/sys rw shared:4 - sysfs sysfs rw\n\
+                    43 24 8:1 / /g/abcd/mnt rw shared:5 - ext4 /dev/loop1 rw\n\
+                    44 24 0:41 / /home/elsewhere rw shared:6 - tmpfs t rw\n";
+        // children before parent; /g/abcd is a prefix-string match but not
+        // a path-prefix match → excluded; order among equal-depth children
+        // follows input.
+        assert_eq!(
+            mounts_under(info, "/g/abc"),
+            ["/g/abc/mnt/dev", "/g/abc/mnt/proc", "/g/abc/mnt/sys", "/g/abc/mnt"]
+        );
+        // the mount point itself counts (crashes can mount exactly at gdir)
+        let info2 = "36 24 7:0 / /g/abc rw,relatime shared:1 - ext4 /dev/loop0 rw\n";
+        assert_eq!(mounts_under(info2, "/g/abc"), ["/g/abc"]);
+        // malformed/short lines are ignored, not panics
+        assert!(mounts_under("junk\n36 24\n", "/g").is_empty());
+    }
+
+    #[test]
+    fn mountinfo_octal_unescape() {
+        let info = "36 24 7:0 / /mnt/my\\040dir/sub rw shared:1 - ext4 /dev/loop0 rw\n";
+        assert_eq!(mounts_under(info, "/mnt/my dir"), vec!["/mnt/my dir/sub".to_string()]);
+        // non-octal backslash garbage passes through as-is
+        let info2 = "36 24 7:0 / /weird\\999path rw shared:1 - ext4 /dev/loop0 rw\n";
+        assert_eq!(mounts_under(info2, r"/weird\999path"), [r"/weird\999path"]);
+    }
+
+    #[test]
+    fn loop_backing_scoped_and_deduped() {
+        let info = "36 24 7:0 / /g/abc/mnt rw shared:1 - ext4 /dev/loop0 rw\n\
+                    40 36 0:38 / /g/abc/mnt/dev rw shared:2 - tmpfs tmpfs rw\n\
+                    43 24 8:1 / /g/zzz/mnt rw shared:5 - ext4 /dev/loop7 rw\n\
+                    44 36 7:0 / /g/abc/mnt/extra rw shared:6 - ext4 /dev/loop0 rw\n";
+        // only loop-backed mounts under the prefix, deduped (tmpfs source
+        // is not a loop device; loop7 is another golden's)
+        assert_eq!(loop_backing(info, "/g/abc"), vec!["/dev/loop0".to_string()]);
+        assert!(loop_backing("not mountinfo at all", "/g").is_empty());
+    }
+
+    #[test]
+    fn losetup_j_output_parsed() {
+        let out = "/dev/loop3: [0807]:1234 (/g/abc/rootfs.raw)\n/dev/loop4: [0807]:1235 (/other)\n";
+        assert_eq!(losetup_devices(out), ["/dev/loop3", "/dev/loop4"]);
+        assert!(losetup_devices("").is_empty());
+        assert!(losetup_devices("/dev/sda1: [66305]:2 (/x)\n").is_empty());
+    }
+
+    #[test]
+    fn bake_socket_pid_own_scheme_only() {
+        assert_eq!(bake_socket_pid("bay-bake-42.sock"), Some(42));
+        assert_eq!(bake_socket_pid("bay-bake-42-vsock.sock"), Some(42));
+        // near-misses must NOT match: other names, malformed pids, other
+        // suffixes — the sweep must never claim a foreign /tmp file.
+        for n in [
+            "bay-baked.sock", "bay-bake-.sock", "bay-bake-x.sock",
+            "bay-bake-42-tmp.sock", "bay-bake-42", "other-42.sock",
+            "bay-bake-42.sock.bak", "bay-bake--42.sock",
+        ] {
+            assert_eq!(bake_socket_pid(n), None, "{n} must not match our scheme");
+        }
+    }
+
+    #[test]
+    fn proc_alive_reads_pid_dirs() {
+        let dir = tempdir("proc");
+        let proc = dir.join("fake-proc");
+        std::fs::create_dir_all(proc.join("12345")).unwrap();
+        assert!(proc_alive(&proc, 12345));
+        assert!(!proc_alive(&proc, 12346));
+        assert!(!proc_alive(&proc.join("nonexistent"), 12345));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     fn tempdir(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!("bay-bk-{}-{}", tag, std::process::id()));
         let _ = std::fs::remove_dir_all(&p);
@@ -511,7 +726,7 @@ base_rootfs = "r"
 mod integration {
     use super::*;
     use crate::engine::{Engine, Golden};
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
     #[test]
     #[ignore = "boots real VMs; needs WSL2 + BAY_TEST_{CH,REMOTE,KERNEL,INITRD,ROOTFS}"]
@@ -595,6 +810,101 @@ mod integration {
         anyhow::ensure!(out.stdout.is_empty(), "orphaned CH processes: {}", String::from_utf8_lossy(&out.stdout));
 
         // cleanup: as root the sealed 0555 dirs are still removable
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    /// #28 round-1 blocker, live: SIGKILL a `bay bake` child while its
+    /// gdir/mnt loop mount is up (sleeping setup script keeps the chroot
+    /// window open), then run the SAME bake again — the recovery teardown
+    /// must clear the EBUSY wedge and seal. Needs WSL2 root + kit, and a
+    /// built CLI (`cargo build` first; override path with BAY_BIN).
+    #[test]
+    #[ignore = "kills processes and mounts loops; needs WSL2 root + #16 kit"]
+    fn sigkill_in_mount_window_recovers() -> anyhow::Result<()> {
+        std::env::set_var("BAY_CH_BIN", crate::ch50::integration::kit("BAY_TEST_CH"));
+        std::env::set_var("BAY_CH_REMOTE", crate::ch50::integration::kit("BAY_TEST_REMOTE"));
+        let root = std::path::Path::new("/tmp").join(format!("bay-crash-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let home = root.join("home");
+        std::fs::create_dir_all(&home)?;
+        std::env::set_var("BAY_HOME", &home);
+
+        // setup script sleeps: bake sits inside the mount-to-flip window.
+        std::fs::write(root.join("setup.sh"), "sleep 300\n")?;
+        let mp = root.join("golden.toml");
+        std::fs::write(
+            &mp,
+            format!(
+                "kernel = {:?}\ninitramfs = {:?}\nbase_rootfs = {:?}\nscripts = [\"setup.sh\"]\n",
+                crate::ch50::integration::kit("BAY_TEST_KERNEL"),
+                crate::ch50::integration::kit("BAY_TEST_INITRD"),
+                crate::ch50::integration::kit("BAY_TEST_ROOTFS"),
+            ),
+        )?;
+        let m = Manifest::load(&mp)?;
+        let hash = m.content_hash(&std::fs::read(&mp)?)?;
+        let gdir = golden_dir(&home, &hash);
+
+        // the CLI binary the child bakes with: next to the test binary in
+        // target/debug/, or explicit BAY_BIN.
+        let bin = std::env::var_os("BAY_BIN").map(PathBuf::from).unwrap_or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|e| e.parent().and_then(|p| p.parent()).map(|d| d.join("bay")))
+                .unwrap_or_else(|| PathBuf::from("bay"))
+        });
+        let mut child = std::process::Command::new(&bin)
+            .arg("bake")
+            .arg(&mp)
+            .env("BAY_HOME", &home)
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("spawn {}: {e}", bin.display()))?;
+
+        // wait for the mount window: gdir/mnt visible in mountinfo
+        let prefix = gdir.display().to_string();
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let info = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+            if !mounts_under(&info, &prefix).is_empty() {
+                break;
+            }
+            anyhow::ensure!(
+                child.try_wait()?.is_none(),
+                "bake child exited before the mount window opened"
+            );
+            anyhow::ensure!(Instant::now() < deadline, "mount window never opened");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        child.kill()?; // SIGKILL mid-window: the in-memory stack dies with it
+        let _ = child.wait()?;
+        assert!(super::marker(&home, &hash).exists(), "crash must leave the in-flight marker");
+        // plant dead-pid + foreign sockets: recovery sweeps ours, never the
+        // foreign file.
+        let tmp = std::env::temp_dir();
+        let own = tmp.join("bay-bake-4294967295.sock"); // pid that cannot exist
+        let foreign = tmp.join("bay-bake-impostor.sock");
+        std::fs::write(&own, b"")?;
+        std::fs::write(&foreign, b"")?;
+
+        // the wedge: pre-fix this Errs EBUSY forever. Must now succeed.
+        let out = run(&mp)?;
+        assert!(out.baked, "recovery bake must be a real bake");
+        assert_eq!(out.hash, hash);
+        assert!(!super::marker(&home, &hash).exists());
+
+        // no stranded mounts/loops under gdir, staging gone, sockets swept
+        let info = std::fs::read_to_string("/proc/self/mountinfo")?;
+        assert!(mounts_under(&info, &prefix).is_empty(), "stranded mounts remain");
+        assert!(loop_backing(&info, &prefix).is_empty(), "stranded loop devices remain");
+        assert!(!gdir.join("mnt").exists() && !gdir.join("rootfs.raw").exists());
+        assert!(!own.exists(), "dead-pid bake socket not swept");
+        assert!(foreign.exists(), "sweep must not touch foreign /tmp files");
+        let _ = std::fs::remove_file(&foreign);
+
+        // kill any VM the dead child may have left (comm name only, spike
+        // gotcha #2) and the scratch tree.
+        let _ = std::process::Command::new("killall").arg("ch-v50").output();
         let _ = std::fs::remove_dir_all(&root);
         Ok(())
     }

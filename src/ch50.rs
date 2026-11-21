@@ -168,35 +168,37 @@ impl Engine for Ch50Engine {
             .spawn()
             .map_err(|e| anyhow::anyhow!("spawn {}: {e}", self.ch_bin.display()))?;
         // Cold boot to the guest's BAY_READY marker on the serial console
-        // (~1.8s at 50M in M0; generous ceiling for loaded hosts).
-        let deadline = Instant::now() + Duration::from_secs(120);
-        loop {
-            let log = std::fs::read(&serial_log).unwrap_or_default();
-            if log.windows(9).any(|w| w == b"BAY_READY") {
-                break;
-            }
-            if vm.try_wait().map_err(|e| anyhow::anyhow!("wait bake VM: {e}"))?.is_some()
-                || Instant::now() >= deadline
-            {
-                let _ = vm.kill();
-                let _ = vm.wait();
-                anyhow::bail!("bake VM died or timed out before BAY_READY (see {})", serial_log.display());
-            }
-            std::thread::sleep(Duration::from_millis(25));
-        }
+        // (~1.8s at 50M in M0; generous ceiling for loaded hosts). The whole
+        // post-spawn flow lives in one closure so the reap+unlink guard below
+        // runs on EVERY exit path — an early bail that skipped the unlinks
+        // left /tmp/bay-bake-*.sock stranding after a dead VM (#28 review).
         let flow = (|| -> anyhow::Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(120);
+            loop {
+                let log = std::fs::read(&serial_log).unwrap_or_default();
+                if log.windows(9).any(|w| w == b"BAY_READY") {
+                    break;
+                }
+                if vm.try_wait().map_err(|e| anyhow::anyhow!("wait bake VM: {e}"))?.is_some()
+                    || Instant::now() >= deadline
+                {
+                    anyhow::bail!("bake VM died or timed out before BAY_READY (see {})", serial_log.display());
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
             run_remote(&self.ch_remote, &api, "pause", None)?;
             run_remote(&self.ch_remote, &api, "snapshot", Some(&file_url(&dir.join("snapshot"))))?;
             Ok(())
         })();
-        // Always reap: a failed pause/snapshot must not orphan the VM.
+        // Always reap and unlink, failure or not: a dead bake VM must not
+        // orphan the process or leave its sockets in /tmp.
         let _ = vm.kill();
-        vm.wait().map_err(|e| anyhow::anyhow!("waitpid bake VM: {e}"))?;
+        let _ = vm.wait();
+        let _ = unlink(&api);
+        let _ = unlink(&vsock);
         flow?;
         // Transient sockets are not part of the golden contract; the vsock
         // path recorded in snapshot config.json is rewritten per bay at boot.
-        unlink(&api)?;
-        unlink(&vsock)?;
         // DR-1: the overlay template (backing = base, absolute) is created
         // once here so `boot` is a 196KB copy with no qemu-img at up time.
         let out = Command::new("qemu-img")
