@@ -26,6 +26,10 @@ in place. Full design: `docs/ARCHITECTURE.md`. Plan and todos: GitHub issues
 3. **Never push to main.** Branch → PR → squash-merge. Protection enforces
    this, admins included.
 
+## Fleet operations
+
+docs/FLEET.md governs autonomous multi-agent work; this file's three rules remain absolute.
+
 ## Commands
 
 ```
