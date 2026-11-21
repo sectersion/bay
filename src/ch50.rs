@@ -124,17 +124,7 @@ impl Ch50Engine {
             .get(&bay)
             .map(|r| r.api_sock.clone())
             .ok_or_else(|| anyhow::anyhow!("bay {bay} is not running"))?;
-        let out = Command::new(&self.ch_remote)
-            .args(remote_argv(&api, verb, arg))
-            .output()?;
-        if out.status.success() {
-            Ok(())
-        } else {
-            anyhow::bail!(
-                "ch-remote {verb} (bay {bay}): {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
+        run_remote(&self.ch_remote, &api, verb, arg)
     }
 
     /// SIGKILL + waitpid. Never leaves a zombie or a live VM behind.
@@ -152,6 +142,75 @@ impl Ch50Engine {
 impl Engine for Ch50Engine {
     fn name(&self) -> &'static str {
         "ch50"
+    }
+
+    fn bake(&mut self, golden: &Golden) -> anyhow::Result<()> {
+        let dir = &golden.path;
+        std::fs::create_dir_all(dir.join("snapshot"))?;
+        // Transient sockets live under /tmp with a pid suffix, NOT in the
+        // golden dir: ~/.bay/golden/<64-hex>/bake-vsock.sock runs to ~109
+        // chars and the AF_UNIX sun_path budget is 108 — CH fails to bind
+        // and the VM dies at spawn (live-verified WSL, #15). The vsock path
+        // is only recorded in snapshot config.json, which boot rewrites.
+        let tmp = std::env::temp_dir();
+        let pid = std::process::id();
+        let api = tmp.join(format!("bay-bake-{pid}.sock"));
+        let vsock = tmp.join(format!("bay-bake-{pid}-vsock.sock"));
+        let serial_log = dir.join("serial.log");
+        unlink(&api)?;
+        unlink(&vsock)?;
+        let serial = std::fs::File::create(&serial_log)?;
+        let mut vm = Command::new(&self.ch_bin)
+            .args(bake_boot_argv(&api, &dir.join("kernel"), &dir.join("initramfs"), &dir.join("disk.qcow2"), &vsock))
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(serial.try_clone()?))
+            .stderr(Stdio::from(serial))
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("spawn {}: {e}", self.ch_bin.display()))?;
+        // Cold boot to the guest's BAY_READY marker on the serial console
+        // (~1.8s at 50M in M0; generous ceiling for loaded hosts). The whole
+        // post-spawn flow lives in one closure so the reap+unlink guard below
+        // runs on EVERY exit path — an early bail that skipped the unlinks
+        // left /tmp/bay-bake-*.sock stranding after a dead VM (#28 review).
+        let flow = (|| -> anyhow::Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(120);
+            loop {
+                let log = std::fs::read(&serial_log).unwrap_or_default();
+                if log.windows(9).any(|w| w == b"BAY_READY") {
+                    break;
+                }
+                if vm.try_wait().map_err(|e| anyhow::anyhow!("wait bake VM: {e}"))?.is_some()
+                    || Instant::now() >= deadline
+                {
+                    anyhow::bail!("bake VM died or timed out before BAY_READY (see {})", serial_log.display());
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            run_remote(&self.ch_remote, &api, "pause", None)?;
+            run_remote(&self.ch_remote, &api, "snapshot", Some(&file_url(&dir.join("snapshot"))))?;
+            Ok(())
+        })();
+        // Always reap and unlink, failure or not: a dead bake VM must not
+        // orphan the process or leave its sockets in /tmp.
+        let _ = vm.kill();
+        let _ = vm.wait();
+        let _ = unlink(&api);
+        let _ = unlink(&vsock);
+        flow?;
+        // Transient sockets are not part of the golden contract; the vsock
+        // path recorded in snapshot config.json is rewritten per bay at boot.
+        // DR-1: the overlay template (backing = base, absolute) is created
+        // once here so `boot` is a 196KB copy with no qemu-img at up time.
+        let out = Command::new("qemu-img")
+            .args(create_overlay_argv(&dir.join("disk.qcow2"), &dir.join("overlay.tmpl.qcow2")))
+            .output()?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "qemu-img overlay: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(())
     }
 
     fn boot(&mut self, bay: u32, golden: &Golden) -> anyhow::Result<Pty> {
@@ -272,6 +331,48 @@ pub(crate) fn remote_argv(api: &Path, verb: &str, arg: Option<&str>) -> Vec<Stri
         v.push(a.to_string());
     }
     v
+}
+
+/// argv for the bake cold boot: direct kernel/initramfs boot of the golden
+/// payload at 50M (matching bay sizing so the snapshot's memory-ranges are
+/// bay-sized), serial on tty for the BAY_READY marker, vsock so the snapshot
+/// freezes a live PTY listener. Same shape the #16 integration test proved.
+pub(crate) fn bake_boot_argv(api: &Path, kernel: &Path, initramfs: &Path, disk: &Path, vsock: &Path) -> Vec<String> {
+    vec![
+        "--api-socket".into(), api.display().to_string(),
+        "--kernel".into(), kernel.display().to_string(),
+        "--initramfs".into(), initramfs.display().to_string(),
+        "--disk".into(), format!("path={}", disk.display()),
+        "--memory".into(), "size=50M".into(),
+        "--cpus".into(), "boot=1".into(),
+        "--console".into(), "off".into(),
+        "--serial".into(), "tty".into(),
+        "--vsock".into(), format!("cid=3,socket={}", vsock.display()),
+        "--cmdline".into(), "console=ttyS0".into(),
+    ]
+}
+
+/// argv creating the golden's fresh overlay template: qcow2 whose backing is
+/// the base (qcow2 format mandated by CH v50's reader, DR-1).
+pub(crate) fn create_overlay_argv(base: &Path, tmpl: &Path) -> Vec<String> {
+    vec![
+        "create".into(), "-f".into(), "qcow2".into(),
+        "-b".into(), base.display().to_string(), "-F".into(), "qcow2".into(),
+        tmpl.display().to_string(),
+    ]
+}
+
+/// One ch-remote invocation against an explicit api socket (bake VM included).
+fn run_remote(bin: &Path, api: &Path, verb: &str, arg: Option<&str>) -> anyhow::Result<()> {
+    let out = Command::new(bin).args(remote_argv(api, verb, arg)).output()?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "ch-remote {verb}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
 }
 
 /// `file://` URL for CH snapshot/restore destinations. CH parses these as
@@ -483,6 +584,40 @@ mod tests {
             "file:///root/x/snap"
         );
     }
+
+    #[test]
+    fn bake_boot_argv_exact() {
+        let argv = bake_boot_argv(
+            Path::new("/g/api.sock"),
+            Path::new("/g/kernel"),
+            Path::new("/g/initramfs"),
+            Path::new("/g/disk.qcow2"),
+            Path::new("/g/vsock.sock"),
+        );
+        assert_eq!(
+            argv,
+            [
+                "--api-socket", "/g/api.sock",
+                "--kernel", "/g/kernel",
+                "--initramfs", "/g/initramfs",
+                "--disk", "path=/g/disk.qcow2",
+                "--memory", "size=50M",
+                "--cpus", "boot=1",
+                "--console", "off",
+                "--serial", "tty",
+                "--vsock", "cid=3,socket=/g/vsock.sock",
+                "--cmdline", "console=ttyS0",
+            ]
+        );
+    }
+
+    #[test]
+    fn create_overlay_argv_qcow2_backing() {
+        assert_eq!(
+            create_overlay_argv(Path::new("/g/disk.qcow2"), Path::new("/g/overlay.tmpl.qcow2")),
+            ["create", "-f", "qcow2", "-b", "/g/disk.qcow2", "-F", "qcow2", "/g/overlay.tmpl.qcow2"]
+        );
+    }
 }
 
 /// Exit test for #16: two bays from one golden; a write in bay 1 must not
@@ -495,18 +630,18 @@ mod tests {
 /// BAY_TEST_ROOTFS=/root/bay-m1c/rootfs.ext4 cargo test -- --ignored
 /// ```
 #[cfg(all(unix, test))]
-mod integration {
+pub(crate) mod integration {
     use super::*;
     use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
 
-    fn kit(k: &str) -> PathBuf {
+    pub(crate) fn kit(k: &str) -> PathBuf {
         std::env::var_os(k)
             .map(PathBuf::from)
             .unwrap_or_else(|| panic!("{k} must point at the WSL kit (see #16)"))
     }
 
-    fn run(program: &str, args: &[&str]) -> anyhow::Result<()> {
+    pub(crate) fn run(program: &str, args: &[&str]) -> anyhow::Result<()> {
         let out = Command::new(program).args(args).output()?;
         if out.status.success() {
             Ok(())
@@ -520,7 +655,7 @@ mod integration {
 
     /// vsockd PTY: CONNECT 7, then feed `input`, drain until the guest hangs
     /// up (e.g. `exit`).
-    fn pty(socket: &Path, input: &str) -> anyhow::Result<String> {
+    pub(crate) fn pty(socket: &Path, input: &str) -> anyhow::Result<String> {
         let mut s = UnixStream::connect(socket)?;
         s.set_read_timeout(Some(Duration::from_secs(10)))?;
         s.set_write_timeout(Some(Duration::from_secs(5)))?;

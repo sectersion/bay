@@ -19,6 +19,16 @@ pub struct Pty {
 pub trait Engine {
     fn name(&self) -> &'static str;
 
+    /// Produce the hypervisor-specific parts of a golden (M1b, #15):
+    /// cold-boot `golden.path/{kernel,initramfs,disk.qcow2}` (one CPU, 50M),
+    /// wait for the BAY_READY marker on the serial log (`golden.path/serial.log`),
+    /// pause, snapshot into `golden.path/snapshot/`, create the CoW overlay
+    /// template `golden.path/overlay.tmpl.qcow2`, kill the VM. Requires the
+    /// named payload files to already exist at their final golden paths;
+    /// fleet-independent inputs (packages, scripts) are staged by `bake`
+    /// before this is called.
+    fn bake(&mut self, golden: &Golden) -> anyhow::Result<()>;
+
     /// Restore a bay from the golden with a fresh CoW disk. Target: ~200ms.
     /// `bay` is the daemon's fleet id (the same one halt/resume/kill take);
     /// the engine keys its per-bay state by it.

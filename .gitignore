@@ -1,1 +1,6 @@
 /target
+
+# MCP seat helper scratch (kept out of the tree)
+.tmp-*.sh
+.tmp-*.md
+.tmp-*.json
