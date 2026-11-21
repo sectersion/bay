@@ -19,8 +19,10 @@ top of those.
 ### Triage
 - **Scope provenance is the `pre-approved` GitHub label.** The label marks
   the owner's awake intent: it is applied only under an explicit owner
-  directive, and no overnight agent applies or removes it, even though it
-  shares the owner's credentials. Fleet may only build issues carrying it
+  directive, and no overnight agent applies, removes, **or edits the body of
+  a labeled issue** — even though it shares the owner's credentials; the
+  label proves the approved body *as written*, and relaboring by rewriting
+  an exit test is scope theft even when the label survives. Fleet may only build issues carrying it
   (M1's boxes #14–#17). Milestones (M1–M4 = #2–#5) say *where* work
   belongs; the label is the *proof* it was approved. A body string like
   "Pre-approved box" is not provenance — any agent can type it.
