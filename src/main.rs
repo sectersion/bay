@@ -2,6 +2,7 @@
 
 use clap::{Parser, Subcommand};
 
+mod bake;
 mod ch50;
 mod client;
 mod daemon;
@@ -54,8 +55,15 @@ enum Cmd {
 fn main() -> anyhow::Result<()> {
     match Cli::parse().cmd {
         Cmd::Daemon => daemon::run(),
+        // bake is the one command not yet routed through bayd: dispatch is
+        // stateless and the daemon holds no engine yet (#15). Flip this to
+        // `submit(Request::Bake { .. })` when bake moves daemon-internal.
+        Cmd::Bake { manifest } => {
+            let out = bake::run(&manifest)?;
+            println!("{}", serde_json::to_string(&out)?);
+            Ok(())
+        }
         Cmd::Ping => submit(Request::Ping),
-        Cmd::Bake { manifest } => submit(Request::Bake { manifest }),
         Cmd::Up { n, repo } => submit(Request::Up { n, repo }),
         Cmd::Exec { bay, cmd } => submit(Request::Exec { bay, argv: cmd }),
         Cmd::Halt { bay } => submit(Request::Halt { bay }),
