@@ -17,11 +17,13 @@ top of those.
 ## Roles
 
 ### Triage
-- **Scope provenance is the `pre-approved` GitHub label.** Only the owner's
-  account may apply it; fleet may only build issues carrying it (M1's boxes
-  #14–#17). Milestones (M1–M4 = #2–#5) say *where* work belongs; the label
-  is the *proof* it was approved. A body string like "Pre-approved box" is
-  not provenance — any agent can type it.
+- **Scope provenance is the `pre-approved` GitHub label.** The label marks
+  the owner's awake intent: it is applied only under an explicit owner
+  directive, and no overnight agent applies or removes it, even though it
+  shares the owner's credentials. Fleet may only build issues carrying it
+  (M1's boxes #14–#17). Milestones (M1–M4 = #2–#5) say *where* work
+  belongs; the label is the *proof* it was approved. A body string like
+  "Pre-approved box" is not provenance — any agent can type it.
 - Overnight triage may draft new issues **into `needs-human` only** — an
   agent-filed, agent-labeled, or unlabeled issue is never built. No package
   without an exit test.
@@ -54,8 +56,10 @@ top of those.
   1. two `APPROVED` reviews naming the current head SHA — **each review
      body names its registered board seat and posture, and the two names
      must be two distinct entries on the agent roster.** All fleet GitHub
-     action shares one account; the roster cross-check is what makes "two
-     independent reviews" verifiable. The digest lists the two seat names.
+     action shares one account; the roster cross-check is a tripwire that
+     catches one seat double-posting — it cannot prove independence (one
+     shared account, self-attested seats); independence stays procedural,
+     like the gate in CLAUDE.md rule 2. The digest lists the two seat names.
   2. CI green (three-OS `cargo test` matrix, #10),
   3. **Scope = the minimal change set that makes the issue's exit test
      pass.** If you can't name a change's contribution to the exit test,
@@ -79,6 +83,10 @@ top of those.
   (#12 review), and qcow2 backing chains (#16) would make the collision
   routine, not exotic. A disk-lock failure means the seat is taken, not a
   bug to fight.
+- The lock is the sharpest edge, not the only one: the seat serializes one
+  VM at a time on the single WSL host for capacity and idle-teardown
+  hygiene too — per-bay CoW overlays (M1) won't collide on the golden, but
+  the claim-first rule stays unconditional either way.
 - No extra tie-break machinery: `claim_task` on one task *is* the tie-break
   for two simultaneous repro needs. The seat holder posts repro output to
   the PR so static-only seats can consume it.
@@ -135,9 +143,11 @@ bullet says otherwise:
   approval exist to prevent.
 - **Morning digest** — the owner's only read surface, posted **by the
   merge-queue agent** as a comment on the milestone tracking epic (`#2` for
-  M1) at the hard stop (empty board queue) or when the PR set goes quiet,
-  whichever comes first. A no-op night still gets a digest saying so —
-  silence is not a pass. One comment listing:
+  M1) at the hard stop (empty board queue), or early when the PR set goes
+  quiet. An early digest is not terminal: if work resumes and anything new
+  merges, blocks, or reverts after publication, the merge queue amends the
+  same digest — the owner's read surface never omits late-landed work.
+  A no-op night still gets a digest saying so — silence is not a pass. One comment listing:
   - **merged** — PRs merged, at which head SHAs, naming the two review
     seats whose approvals cleared the roster cross-check;
   - **blocked** — tasks past lease still `in_progress`, or `failed`, with why;
