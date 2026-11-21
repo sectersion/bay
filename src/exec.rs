@@ -170,16 +170,15 @@ mod relay_impl {
             bay,
             argv: argv.to_vec(),
         };
-        let mut sock = UnixStream::connect(crate::daemon::sock_path()?).map_err(|_| {
-            anyhow::anyhow!(
-                "cannot reach bayd at {} — start it with `bay daemon`",
-                crate::daemon::sock_path()?.display()
-            )
+        let sock = crate::daemon::sock_path()?;
+        let mut sock_conn = UnixStream::connect(&sock).map_err(|_| {
+            anyhow::anyhow!("cannot reach bayd at {} — start it with `bay daemon`", sock.display())
         })?;
+        let sock = &mut sock_conn;
         writeln!(sock, "{}", serde_json::to_string(&req)?)?;
         // one byte at a time: the ack is exactly one line, and the raw
         // stream that follows must not be swallowed by a read-ahead buffer.
-        let line = read_line(&mut sock, Some(std::time::Duration::from_secs(10)), 4096)?;
+        let line = read_line(sock, Some(std::time::Duration::from_secs(10)), 4096)?;
         let resp: crate::protocol::Response = serde_json::from_slice(&line)?;
         if let crate::protocol::Response::Err { error } = resp {
             anyhow::bail!("bayd: {error}");
@@ -225,7 +224,7 @@ mod relay_impl {
 
     /// Byte-at-a-time line read — never over-reads, so the same connection
     /// can carry raw bytes after the line (exec upgrade, CONNECT ack).
-    pub(crate) fn read_line(
+    pub fn read_line(
         s: &mut UnixStream,
         timeout: Option<std::time::Duration>,
         cap: usize,
@@ -334,6 +333,11 @@ mod integration {
     }
 
     fn cli(home: &PathBuf, args: &[&str]) -> std::process::Output {
+        assert!(
+            bin().exists(),
+            "CLI binary {} missing — `cargo build` first (or set BAY_BIN), see bake.rs integration docs",
+            bin().display()
+        );
         Command::new(bin())
             .args(args)
             .env("BAY_HOME", home)
@@ -389,6 +393,7 @@ mod integration {
         assert!(baked.baked);
 
         // daemon up (its own BAY_HOME), then the exit test itself
+        assert!(bin().exists(), "CLI binary {} missing — cargo build first", bin().display());
         let mut daemon = Command::new(bin())
             .arg("daemon")
             .env("BAY_HOME", &home)
@@ -414,10 +419,18 @@ mod integration {
         );
         println!("EXEC1: {text:?} exit={:?}", out.status.code());
 
-        // 2. concurrent exec in both bays (both live; seat rule covers VMs,
-        //    relay concurrency is the point of this box)
-        let a = Command::new(bin()).args(["exec", "1", "--", "echo", "A"]).env("BAY_HOME", &home).output()?;
-        let b = Command::new(bin()).args(["exec", "2", "--", "echo", "B"]).env("BAY_HOME", &home).output()?;
+        // 2. concurrent exec in both bays (both live VMs relaying at once)
+        let a = Command::new(bin())
+            .args(["exec", "1", "--", "echo", "A"])
+            .env("BAY_HOME", &home)
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        let b = Command::new(bin())
+            .args(["exec", "2", "--", "echo", "B"])
+            .env("BAY_HOME", &home)
+            .stdout(std::process::Stdio::piped())
+            .spawn()?;
+        let (a, b) = (a.wait_with_output()?, b.wait_with_output()?);
         anyhow::ensure!(
             a.status.success() && b.status.success()
                 && String::from_utf8_lossy(&a.stdout).contains('A')

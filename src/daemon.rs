@@ -229,20 +229,23 @@ mod tests {
         let sock = std::env::temp_dir().join(format!("bayd-p-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&sock);
         let cli_l = UnixListener::bind(&sock).unwrap();
-        let guest_l = UnixListener::bind(format!("{}g", sock.display())).unwrap();
-        std::thread::spawn(|| {
+        let gpath = format!("{}g", sock.display());
+        let guest_l = UnixListener::bind(&gpath).unwrap();
+        std::thread::spawn(move || {
             let (mut g, _) = guest_l.accept().unwrap();
             let first = crate::exec::read_line(&mut g, None, 64).unwrap();
             assert_eq!(first, b"CONNECT 7");
             g.write_all(b"OK 7\n").unwrap();
             let req = crate::exec::read_line(&mut g, None, 8192).unwrap();
-            g.write_all(&req).unwrap();
+            g.write_all(&req).unwrap(); // "payload" (command output)
             g.write_all(b"\n").unwrap();
-            g.write_all(b"BAY_EXIT n5 5\n").unwrap();
+            g.write_all(b"\nBAY_EXIT n5 5\n").unwrap(); // vsockd.c footer
         });
-        std::thread::spawn(|| {
+        let spath = sock.clone();
+        std::thread::spawn(move || {
             let (mut cli, _) = cli_l.accept().unwrap();
-            let mut vsock = UnixStream::connect(format!("{}g", sock.display())).unwrap();
+            let gpath = format!("{}g", spath.display());
+            let mut vsock = UnixStream::connect(gpath).unwrap();
             vsock.write_all(crate::exec::CONNECT).unwrap();
             let _ = crate::exec::read_line(&mut vsock, None, 64).unwrap();
             let _ = crate::exec::pipe_both(&mut cli, &mut vsock);
