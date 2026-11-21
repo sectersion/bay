@@ -17,15 +17,20 @@ top of those.
 ## Roles
 
 ### Triage
-- Files work packages **only** from owner-approved milestones (M1–M4 =
-  #2–#5). Each package is a pre-approved GitHub issue that states its exit
-  test up front — see M1's boxes #14–#17, each marked "Pre-approved box".
-- No package without an exit test; no package outside an approved milestone.
+- **Scope provenance is the `pre-approved` GitHub label.** Only the owner's
+  account may apply it; fleet may only build issues carrying it (M1's boxes
+  #14–#17). Milestones (M1–M4 = #2–#5) say *where* work belongs; the label
+  is the *proof* it was approved. A body string like "Pre-approved box" is
+  not provenance — any agent can type it.
+- Overnight triage may draft new issues **into `needs-human` only** — an
+  agent-filed, agent-labeled, or unlabeled issue is never built. No package
+  without an exit test.
 
 ### Worker
 - Claims work from the polymer board, never from thin air: **workers do not
-  self-generate scope.** Found new work while implementing? Comment it on the
-  issue you're working; triage decides whether it becomes one.
+  self-generate scope; workers claim only `pre-approved`-labeled boxes.**
+  Found new work while implementing? Comment it on the issue you're
+  working; triage decides whether it becomes one.
 - One open PR at a time. A worker stops at "ready for review": push, PR with
   `Closes #N`, reviews requested. Never merge.
 
@@ -34,12 +39,11 @@ top of those.
   - **verifier of claims** — checks every claim in the PR body against
     primary evidence (logs, measurements re-read at source, not folklore).
   - **adversary** — tries to break it: exit-test loopholes, edge cases,
-    diff outside issue scope.
-- **No VM launches except the designated live-repro seat.** Cloud
-  Hypervisor locks its disk image, so a second VM on the same image fails
-  the lock — M0's first 50M measurement run was lost exactly this way
-  (#12 review). At most one seat per PR may boot anything, and only when
-  static verification can't settle a claim.
+    diff outside scope (see merge gate 3: anything the exit test doesn't
+    need).
+- **Live repro only when static verification can't settle a claim, and only
+  via the vm-seat (see "One VM at a time" below).** The seat is fleet-wide,
+  not per-PR — a worker booting its exit test blocks reviewers on every PR.
 - Review rounds: after **3 rounds** of CHANGES_REQUESTED without
   convergence, add the `needs-human` label and stop iterating. (Create the
   label on first use if triage hasn't.)
@@ -47,12 +51,37 @@ top of those.
 ### Merge queue
 - **One agent**, sole holder of merge rights. Merges only when all three
   hold, re-checked at head:
-  1. two `APPROVED` reviews naming the current head SHA,
+  1. two `APPROVED` reviews naming the current head SHA — **each review
+     body names its registered board seat and posture, and the two names
+     must be two distinct entries on the agent roster.** All fleet GitHub
+     action shares one account; the roster cross-check is what makes "two
+     independent reviews" verifiable. The digest lists the two seat names.
   2. CI green (three-OS `cargo test` matrix, #10),
-  3. diff stays within the issue's scope.
+  3. **Scope = the minimal change set that makes the issue's exit test
+     pass.** If you can't name a change's contribution to the exit test,
+     it belongs in a comment on the issue, not in the diff.
 - Squash-merge only (repo-enforced).
-- Post-merge breakage: **revert immediately**, then file a bug issue with
-  the failure evidence. Never debug on main.
+- Post-merge breakage: file the bug issue with the failure evidence and
+  open a revert PR (`git revert`) immediately; it merges through the normal
+  gates and may be flagged for priority. **Nobody force-pushes, ever; main
+  is never debugged.** main is push-protected with force-push disabled —
+  there is no emergency path that skips the gates.
+
+## One VM at a time (vm-seat)
+
+- **Any agent that must boot a VM — a worker running its package's exit
+  test or a reviewer doing a live repro — first claims the singleton
+  `vm-seat` board task:** title exactly `fleet:vm-seat`, created once via
+  `create_task`, lease eternal — re-claim it at each boot with
+  `lease_duration_seconds` above the worst-case boot+test.
+- Cloud Hypervisor locks its disk image, so a second VM on the same golden
+  fails the lock — M0's first 50M measurement run was lost exactly this way
+  (#12 review), and qcow2 backing chains (#16) would make the collision
+  routine, not exotic. A disk-lock failure means the seat is taken, not a
+  bug to fight.
+- No extra tie-break machinery: `claim_task` on one task *is* the tie-break
+  for two simultaneous repro needs. The seat holder posts repro output to
+  the PR so static-only seats can consume it.
 
 ## Polymer board
 
@@ -64,17 +93,22 @@ top of those.
   `claim_task`'s `lease_duration_seconds` above the worst-case task time.
   Renewing your own live lease keeps the generation; letting it expire starts
   a new one and you can lose the task.
-- **Status flow:** `to_do` → claim → `in_progress` → `done` (merge queue) or
-  `failed` (stuck, with a comment saying why). The board has no `in_review`
-  status; review state lives on the PR.
+- **Status flow:** `to_do` → claim → `in_progress` → `done` or `failed`
+  (stuck, with a comment saying why). **Workers never set `done`; only the
+  merge-queue agent does, and only after squash-merge** — `done` is
+  terminal, and premature `done` hides unmerged work (incident: a worker
+  marked a task done before its PR #21 was reviewed/merged and the revert
+  was correctly refused). The board has no `in_review` status; review
+  state lives on the PR.
 - **@mentions:** a typo'd or wrong-case `@agent_name` notifies nobody —
   silent drop. Always assert on the returned mentions array; if the agent
   you meant isn't listed, fix the name and repost.
 
 ## WSL2 constraints
 
-The Windows host runs the Linux engine inside WSL2 (`ARCHITECTURE.md`). Paid
-for in M0 (#12 spike notes), still true:
+The Windows host runs the Linux engine inside WSL2 (`ARCHITECTURE.md`).
+Still true on this host; paid for in M0 (#12 spike notes) except where a
+bullet says otherwise:
 
 - **Idle teardown:** mounts, sockets, and VM processes died between bare
   `wsl.exe` invocations (~8s idle). Covered on this host: `/etc/wsl.conf`
@@ -85,10 +119,11 @@ for in M0 (#12 spike notes), still true:
   `wsl.exe … bash <script>` invocation, never across separate ones.
 - **Artifacts on ext4, never `/mnt/c`:** VM images, sockets, and snapshots
   live under the distro's own filesystem (`/root/…`).
-- **`wsl.exe` mangles quoted `-c` scripts** (and POSIX paths get rewritten
-  en route from Git Bash). Write scripts to a file and execute the file; for
-  anything copied out of `/mnt/c`, `tr -d '\r'` first — CRLF from Windows
-  checkouts is what bit the M0 repro steps.
+- **Quoting/paths across `wsl.exe` are hostile from Git Bash:** Git Bash
+  rewrites POSIX arguments en route (reproduced on this host during
+  review; *not* a logged M0 incident). Write scripts to a file and execute
+  the file; for anything copied out of `/mnt/c`, `tr -d '\r'` first — CRLF
+  from Windows checkouts *is* a logged M0 incident (the repro steps).
 - **`pkill -f` matches your own `bash -c`** — you kill yourself. Use
   `killall` on comm names.
 
@@ -98,8 +133,13 @@ for in M0 (#12 spike notes), still true:
   empty — or the next action would be new scope — stop. No self-generated
   work overnight, ever; that is what triage and the owner's milestone
   approval exist to prevent.
-- **Morning digest** — the owner's only read surface, one comment listing:
-  - **merged** — PRs merged, at which head SHAs;
+- **Morning digest** — the owner's only read surface, posted **by the
+  merge-queue agent** as a comment on the milestone tracking epic (`#2` for
+  M1) at the hard stop (empty board queue) or when the PR set goes quiet,
+  whichever comes first. A no-op night still gets a digest saying so —
+  silence is not a pass. One comment listing:
+  - **merged** — PRs merged, at which head SHAs, naming the two review
+    seats whose approvals cleared the roster cross-check;
   - **blocked** — tasks past lease still `in_progress`, or `failed`, with why;
   - **reverted** — any reverts plus the bug issues filed for them;
   - **needs-human** — everything labeled after the 3-round cap.
