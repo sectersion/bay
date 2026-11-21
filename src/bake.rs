@@ -158,6 +158,9 @@ pub(crate) fn bind_argv(src: &str, dst: &Path) -> Vec<String> {
 pub(crate) fn umount_argv(dir: &Path) -> Vec<String> {
     vec!["umount".into(), dir.display().to_string()]
 }
+pub(crate) fn umount_lazy_argv(dir: &Path) -> Vec<String> {
+    vec!["umount".into(), "-l".into(), dir.display().to_string()]
+}
 pub(crate) fn apt_install_argv(mnt: &Path, pkgs: &[String]) -> Vec<String> {
     let mut v = vec![
         "chroot".into(), mnt.display().to_string(),
@@ -313,11 +316,21 @@ fn teardown_mounts(gdir: &Path, eager: bool) -> anyhow::Result<()> {
     let prefix = gdir.display().to_string();
     let info = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
     for p in mounts_under(&info, &prefix) {
-        let r = run_cmd(&umount_argv(Path::new(&p)));
-        if eager {
-            r?;
-        } else {
-            let _ = r;
+        let mnt = Path::new(&p);
+        match run_cmd(&umount_argv(mnt)) {
+            Ok(()) => {}
+            Err(e) => {
+                if eager {
+                    return Err(e);
+                }
+                // A SIGKILLed bake can leave chroot occupants alive for a
+                // moment; plain umount says EBUSY. Lazy detach makes the
+                // mountpoint vanish from the namespace immediately, which
+                // is all remove_dir_all needs — and recovery re-bakes
+                // from the base rootfs anyway, so unflushed staging data
+                // is intentionally discarded here.
+                let _ = run_cmd(&umount_lazy_argv(mnt));
+            }
         }
     }
     for dev in loop_backing(&info, &prefix) {
@@ -613,6 +626,7 @@ base_rootfs = "r"
             vec!["mount".into(), "--bind".into(), "/proc".into(), proc.display().to_string()];
         assert_eq!(bind_argv("/proc", &proc), expected);
         assert_eq!(umount_argv(mnt), ["umount", "/g/mnt"]);
+        assert_eq!(umount_lazy_argv(mnt), ["umount", "-l", "/g/mnt"]);
         assert_eq!(
             apt_install_argv(mnt, &["vim-tiny".into(), "git".into()]),
             ["chroot", "/g/mnt", "apt-get", "-y", "-q", "install", "--no-install-recommends", "vim-tiny", "git"]

@@ -1,0 +1,1 @@
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"claim_task","arguments":{"task_id":"ec4cad42-bcbc-4f77-8a2e-cc2348b153cd","lease_duration_seconds":900}}}
