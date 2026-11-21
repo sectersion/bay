@@ -17,7 +17,9 @@
 //! The duality is deliberate: `cmd` for intent, `type` for outcome.
 //!
 //! Contract for later M1 workers: `Response::Ok` gains payload fields as
-//! commands land; `dispatch` is the single place stubs become real.
+//! commands land; `dispatch` is where stateless commands become real.
+//! Commands that need the connection or fleet state (Up, Exec) are routed
+//! in `daemon::handle` before reaching `dispatch`.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;

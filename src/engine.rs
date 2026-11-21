@@ -44,9 +44,10 @@ pub trait Engine {
     fn kill(&mut self, bay: u32) -> anyhow::Result<()>;
 }
 
-/// Pick the engine for the current host.
+/// Pick the engine for the current host. `+ Send` so bayd can hold the one
+/// engine behind a mutex and hand it to connection threads (#17).
 #[cfg(target_os = "linux")]
-pub fn native_engine() -> anyhow::Result<Box<dyn Engine>> {
+pub fn native_engine() -> anyhow::Result<Box<dyn Engine + Send>> {
     use crate::ch50::Ch50Engine;
     Ok(Box::new(Ch50Engine::new(
         crate::daemon::bay_home()?.join("bays"),
@@ -55,7 +56,7 @@ pub fn native_engine() -> anyhow::Result<Box<dyn Engine>> {
 
 /// Pick the engine for the current host.
 #[cfg(not(target_os = "linux"))]
-pub fn native_engine() -> anyhow::Result<Box<dyn Engine>> {
+pub fn native_engine() -> anyhow::Result<Box<dyn Engine + Send>> {
     anyhow::bail!(
         "no engine for this host yet: macOS ships in M3 (#4); on Windows run \
          `bay daemon` under WSL2 — the Cloud Hypervisor v50 engine (ch50) lives there."

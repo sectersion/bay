@@ -7,6 +7,7 @@ mod ch50;
 mod client;
 mod daemon;
 mod engine;
+mod exec;
 mod protocol;
 
 use protocol::Request;
@@ -65,7 +66,10 @@ fn main() -> anyhow::Result<()> {
         }
         Cmd::Ping => submit(Request::Ping),
         Cmd::Up { n, repo } => submit(Request::Up { n, repo }),
-        Cmd::Exec { bay, cmd } => submit(Request::Exec { bay, argv: cmd }),
+        // exec is relay, not request/reply: bayd upgrades the connection to a
+        // raw byte stream after the ack, so this is the one command with its
+        // own client path (still through bayd — daemon stays the sole owner).
+        Cmd::Exec { bay, cmd } => std::process::exit(exec::run(bay, &cmd)?),
         Cmd::Halt { bay } => submit(Request::Halt { bay }),
         Cmd::Wake { bay } => submit(Request::Wake { bay }),
         Cmd::Kill { bay, all } => submit(Request::Kill { bay, all }),
